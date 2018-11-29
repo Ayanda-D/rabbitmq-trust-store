@@ -4,8 +4,9 @@ PROJECT_MOD = rabbit_trust_store_app
 
 define PROJECT_ENV
 [
-	    {default_refresh_interval, 30},
-	    {providers, [rabbit_trust_store_file_provider]}
+	    {operation,        blacklist},
+	    {refresh_interval, 30},
+	    {providers,        [rabbit_trust_store_file_provider]}
 	  ]
 endef
 

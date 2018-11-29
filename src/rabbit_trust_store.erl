@@ -22,7 +22,7 @@
 -behaviour(gen_server).
 
 -export([mode/0, refresh/0, list/0]). %% Console Interface.
--export([whitelisted/3, is_whitelisted/1]). %% Client-side Interface.
+-export([validate/3, is_allowed/2, is_allowed/1]). %% Client-side Interface.
 -export([start_link/0]).
 -export([init/1, terminate/2,
          handle_call/3, handle_cast/2,
@@ -44,6 +44,14 @@
 -type outcome()     :: {valid, state()}
                      | {fail, Reason :: term()}
                      | {unknown, state()}.
+-type issuer_id()   :: {{integer(), [#'AttributeTypeAndValue'{}]}, integer()}.
+-type operation()   :: 'whitelist'
+                     | 'blacklist'.
+
+-define(APP,                          rabbitmq_trust_store).
+-define(TRUST_STORE_TAB,              trust_store_t).
+-define(DEFAULT_REFRESH_INTERVAL,     30).
+-define(OPERATION,                    rabbit_misc:get_env(?APP, operation, whitelist)).
 
 -record(state, {
     providers_state :: [{module(), term()}],
@@ -96,55 +104,60 @@ list() ->
                                   Subject, Issuer, Validity]),
             lists:flatten(Text)
         end,
-        ets:tab2list(table_name())),
+        ets:tab2list(?TRUST_STORE_TAB)),
     string:join(Formatted, "~n~n").
 
 %% Client (SSL Socket) Interface
 
--spec whitelisted(certificate(), event(), state()) -> outcome().
-whitelisted(_, {bad_cert, unknown_ca}, confirmed) ->
-    {valid, confirmed};
-whitelisted(#'OTPCertificate'{}=C, {bad_cert, unknown_ca}, continue) ->
-    case is_whitelisted(C) of
+-spec validate(certificate(), event(), state()) -> outcome().
+validate(C, {bad_cert, unknown_ca}, confirmed) ->
+    ErrMsg = "Certificate badly formatted",
+    rabbit_log:warning(ErrMsg ++ ": ~p", [C]),
+    {fail, ErrMsg};
+validate(#'OTPCertificate'{}=C, {bad_cert, unknown_ca}, continue) ->
+    case is_allowed(C, OP = ?OPERATION) of
         true ->
             {valid, confirmed};
         false ->
-            {fail, "CA not known AND certificate not whitelisted"}
+            {fail, "CA not known AND certificate is " ++ op_fmt(OP)}
     end;
-whitelisted(#'OTPCertificate'{}=C, {bad_cert, selfsigned_peer}, continue) ->
-    case is_whitelisted(C) of
+validate(#'OTPCertificate'{}=C, {bad_cert, selfsigned_peer}, continue) ->
+    case is_allowed(C, OP = ?OPERATION) of
         true ->
             {valid, confirmed};
         false ->
-            {fail, "certificate not whitelisted"}
+            {fail, "certificate is " ++ op_fmt(OP)}
     end;
-whitelisted(_, {bad_cert, _} = Reason, _) ->
+validate(_, {bad_cert, _} = Reason, _) ->
     {fail, Reason};
-whitelisted(_, valid, St) ->
+validate(_, valid, St) ->
     {valid, St};
-whitelisted(#'OTPCertificate'{}=_, valid_peer, St) ->
+validate(#'OTPCertificate'{}=_, valid_peer, St) ->
     {valid, St};
-whitelisted(_, {extension, _}, St) ->
+validate(_, {extension, _}, St) ->
     {unknown, St}.
 
--spec is_whitelisted(certificate()) -> boolean().
-is_whitelisted(#'OTPCertificate'{}=C) ->
-    Id = extract_issuer_id(C),
-    ets:member(table_name(), Id).
+-spec is_allowed(certificate(), operation()) -> boolean().
+is_allowed(C, 'whitelist') -> is_allowed(C);
+is_allowed(C, 'blacklist') -> not is_allowed(C).
+
+-spec is_allowed(certificate()) -> boolean().
+is_allowed(C) -> ets:member(?TRUST_STORE_TAB, extract_issuer_id(C)).
 
 %% Generic Server Callbacks
 
 init([]) ->
     erlang:process_flag(trap_exit, true),
-    ets:new(table_name(), table_options()),
+    ets:new(?TRUST_STORE_TAB, [protected,
+                               named_table,
+                               set,
+                               {keypos, #entry.issuer_id}]),
     Config = application:get_all_env(rabbitmq_trust_store),
     ProvidersState = refresh_certs(Config, []),
     Interval = refresh_interval(Config),
     if
-        Interval =:= 0 ->
-            ok;
-        Interval  >  0 ->
-            erlang:send_after(Interval, erlang:self(), refresh)
+        Interval =< 0 -> ok;
+        true          -> erlang:send_after(Interval, erlang:self(), refresh)
     end,
     {ok,
      #state{
@@ -173,7 +186,7 @@ handle_info(_, St) ->
     {noreply, St}.
 
 terminate(shutdown, _St) ->
-    true = ets:delete(table_name()).
+    true = ets:delete(?TRUST_STORE_TAB).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -183,25 +196,20 @@ code_change(_OldVsn, State, _Extra) ->
 
 mode(#state{refresh_interval = I}) ->
     if
-        I =:= 0 -> 'manual';
-        I  >  0 -> 'automatic'
+        I =< 0  -> 'manual';
+        true    -> 'automatic'
     end.
 
 refresh_interval(Config) ->
     Seconds = case proplists:get_value(refresh_interval, Config) of
         undefined ->
-            default_refresh_interval();
+            ?DEFAULT_REFRESH_INTERVAL;
         S when is_integer(S), S >= 0 ->
             S;
         {seconds, S} when is_integer(S), S >= 0 ->
             S
     end,
     timer:seconds(Seconds).
-
-default_refresh_interval() ->
-    {ok, I} = application:get_env(rabbitmq_trust_store, default_refresh_interval),
-    I.
-
 
 %% =================================
 
@@ -271,13 +279,13 @@ update_certs(CertsList, Provider, Config) ->
 
 load_and_decode_cert(Provider, CertId, Attributes, Config) ->
     try
-        case Provider:load_cert(CertId, Attributes, Config) of
-            {ok, Cert} ->
-                DecodedCert = public_key:pkix_decode_cert(Cert, otp),
-                Id = extract_issuer_id(DecodedCert),
-                {ok, Cert, Id};
-            {error, Reason} -> {error, Reason}
-        end
+        Provider:load_cert(CertId, Attributes, Config)
+    of
+	{ok, Cert} ->
+	    DecodedCert = public_key:pkix_decode_cert(Cert, otp),
+	    Id = extract_issuer_id(DecodedCert),
+	    {ok, Cert, Id};
+	{error, Reason} -> {error, Reason}
     catch _:Error ->
         {error, {Error, erlang:get_stacktrace()}}
     end.
@@ -287,21 +295,21 @@ delete_cert(CertId, Provider) ->
                     when P == Provider, CId == CertId ->
                         true
                     end),
-    ets:select_delete(table_name(), MS).
+    ets:select_delete(?TRUST_STORE_TAB, MS).
 
 save_cert(CertId, Provider, Id, Cert, Name) ->
-    ets:insert(table_name(), #entry{cert_id = CertId,
-                                    provider = Provider,
-                                    issuer_id = Id,
-                                    certificate = Cert,
-                                    name = Name}).
+    ets:insert(?TRUST_STORE_TAB, #entry{cert_id     = CertId,
+                                        provider    = Provider,
+                                        issuer_id   = Id,
+                                        certificate = Cert,
+                                        name        = Name}).
 
 get_old_cert_ids(Provider) ->
     MS = ets:fun2ms(fun(#entry{provider = P, cert_id = CId})
                     when P == Provider ->
                         CId
                     end),
-    ets:select(table_name(), MS).
+    ets:select(?TRUST_STORE_TAB, MS).
 
 providers(Config) ->
     Providers = proplists:get_value(providers, Config, []),
@@ -318,16 +326,6 @@ providers(Config) ->
         end,
         Providers).
 
-table_name() ->
-    trust_store_whitelist.
-
-table_options() ->
-    [protected,
-     named_table,
-     set,
-     {keypos, #entry.issuer_id},
-     {heir, none}].
-
 extract_issuer_id(#'OTPCertificate'{} = C) ->
     {Serial, Issuer} = case public_key:pkix_issuer_id(C, other) of
         {error, _Reason} ->
@@ -342,5 +340,7 @@ clean_deleted_providers(Providers) ->
     [{EntryMatch, _, [true]}] =
         ets:fun2ms(fun(#entry{provider = P})-> true end),
     Condition = [ {'=/=', '$1', Provider} || Provider <- Providers ],
-    ets:select_delete(table_name(), [{EntryMatch, Condition, [true]}]).
+    ets:select_delete(?TRUST_STORE_TAB, [{EntryMatch, Condition, [true]}]).
 
+op_fmt('whitelist')      -> "not whitelisted";
+op_fmt('blacklist')      -> "blacklisted".

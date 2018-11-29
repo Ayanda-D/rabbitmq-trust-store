@@ -66,7 +66,7 @@ edit(Options) ->
         [{verify_fun, {delegate(), continue}},
          {partial_chain, fun partial_chain/1} | Options]).
 
-delegate() -> fun rabbit_trust_store:whitelisted/3.
+delegate() -> fun rabbit_trust_store:validate/4.
 
 partial_chain(Chain) ->
     % special handling of clients that present a chain rather than just a peer cert.
@@ -75,7 +75,7 @@ partial_chain(Chain) ->
             Peer = public_key:pkix_decode_cert(PeerDer, otp),
             % If the Peer is whitelisted make it's immediate Authority a trusted one.
             % This means the peer will automatically be validated.
-            case rabbit_trust_store:is_whitelisted(Peer) of
+            case rabbit_trust_store:is_allowed(Peer) of
                 true -> {trusted_ca, Ca};
                 false -> unknown_ca
             end;
